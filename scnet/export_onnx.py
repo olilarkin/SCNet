@@ -10,11 +10,19 @@ Usage:
 
 Requirements:
     pip install onnx onnxruntime
+
+Note on FFT Operations:
+    SCNet uses the following FFT operations that require ONNX opset 17+:
+    - torch.stft / torch.istft (maps to ONNX STFT operator)
+    - torch.fft.rfft / torch.fft.irfft (maps to ONNX DFT operator)
+
+    PyTorch 2.0+ is recommended for proper FFT export support.
 """
 
 import argparse
 import os
 import sys
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +32,45 @@ from ml_collections import ConfigDict
 
 from .SCNet import SCNet
 from .utils import load_model
+
+
+# Minimum requirements for FFT operations
+MIN_OPSET_VERSION = 17
+MIN_TORCH_VERSION = (2, 0, 0)
+
+
+def check_export_compatibility(opset_version: int, verbose: bool = True) -> list:
+    """
+    Check if the current environment supports exporting FFT operations.
+
+    Returns:
+        List of warning messages (empty if all checks pass)
+    """
+    warnings_list = []
+
+    # Check PyTorch version
+    torch_version = tuple(int(x) for x in torch.__version__.split('.')[:3] if x.isdigit())
+    if len(torch_version) < 3:
+        torch_version = torch_version + (0,) * (3 - len(torch_version))
+
+    if torch_version < MIN_TORCH_VERSION:
+        msg = (f"PyTorch {torch.__version__} detected. PyTorch 2.0+ is recommended "
+               f"for proper FFT operation export (STFT, RFFT, IRFFT).")
+        warnings_list.append(msg)
+
+    # Check opset version
+    if opset_version < MIN_OPSET_VERSION:
+        msg = (f"ONNX opset {opset_version} specified. Opset {MIN_OPSET_VERSION}+ is required "
+               f"for FFT operations (STFT, DFT). The export may fail.")
+        warnings_list.append(msg)
+
+    if verbose and warnings_list:
+        print("\n⚠️  Compatibility Warnings:")
+        for warning in warnings_list:
+            print(f"  - {warning}")
+        print()
+
+    return warnings_list
 
 
 def export_to_onnx(
@@ -43,13 +90,21 @@ def export_to_onnx(
         output_path: Path to save the ONNX model
         sample_rate: Audio sample rate (default: 44100)
         audio_length_seconds: Length of audio in seconds for dummy input
-        opset_version: ONNX opset version (default: 17)
+        opset_version: ONNX opset version (default: 17, minimum for FFT ops)
         dynamic_axes: Whether to use dynamic axes for variable-length audio
         verbose: Print export information
 
     Returns:
         Path to the exported ONNX model
+
+    Note:
+        SCNet uses FFT operations (STFT, RFFT, IRFFT) which require:
+        - ONNX opset version 17 or higher
+        - PyTorch 2.0+ for proper export support
     """
+    # Check compatibility
+    check_export_compatibility(opset_version, verbose=verbose)
+
     model.eval()
     device = next(model.parameters()).device
 
@@ -62,6 +117,7 @@ def export_to_onnx(
         print(f"  Input shape: {dummy_input.shape}")
         print(f"  Output path: {output_path}")
         print(f"  Opset version: {opset_version}")
+        print(f"  FFT operations: STFT, iSTFT, RFFT, iRFFT (require opset 17+)")
 
     # Define input/output names
     input_names = ["audio_input"]
@@ -79,18 +135,32 @@ def export_to_onnx(
     # Export to ONNX
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
 
-    torch.onnx.export(
-        model,
-        dummy_input,
-        output_path,
-        export_params=True,
-        opset_version=opset_version,
-        do_constant_folding=True,
-        input_names=input_names,
-        output_names=output_names,
-        dynamic_axes=dynamic_axes_dict,
-        verbose=False,
-    )
+    try:
+        torch.onnx.export(
+            model,
+            dummy_input,
+            output_path,
+            export_params=True,
+            opset_version=opset_version,
+            do_constant_folding=True,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes_dict,
+            verbose=False,
+        )
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "stft" in error_msg or "fft" in error_msg or "dft" in error_msg:
+            print(f"\n❌ Export failed due to FFT operation: {e}")
+            print("\nTroubleshooting:")
+            print("  1. Ensure you're using PyTorch 2.0+")
+            print("  2. Use opset_version=17 or higher")
+            print("  3. Try upgrading torch: pip install --upgrade torch")
+            raise RuntimeError(
+                f"FFT export failed. SCNet requires PyTorch 2.0+ and ONNX opset 17+ "
+                f"for STFT/RFFT operations. Original error: {e}"
+            )
+        raise
 
     if verbose:
         print(f"  ONNX model exported successfully!")

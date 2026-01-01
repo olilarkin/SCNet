@@ -13,6 +13,11 @@ Requirements:
 
 Note: CoreML models can only run on macOS/iOS devices. Validation will be skipped
 on non-Apple platforms, but the export will still work.
+
+FFT Operations:
+    SCNet uses FFT operations (STFT, RFFT, IRFFT) which are converted via torch.jit.trace.
+    CoreML supports these operations through its neural network primitives, but there may
+    be numerical differences compared to PyTorch due to different FFT implementations.
 """
 
 import argparse
@@ -28,6 +33,45 @@ from ml_collections import ConfigDict
 
 from .SCNet import SCNet
 from .utils import load_model
+
+
+def check_coreml_compatibility(verbose: bool = True) -> list:
+    """
+    Check if the current environment supports CoreML export with FFT operations.
+
+    Returns:
+        List of warning messages (empty if all checks pass)
+    """
+    warnings_list = []
+
+    # Check PyTorch version
+    torch_version = tuple(int(x) for x in torch.__version__.split('.')[:3] if x.isdigit())
+    if len(torch_version) < 3:
+        torch_version = torch_version + (0,) * (3 - len(torch_version))
+
+    if torch_version < (2, 0, 0):
+        msg = (f"PyTorch {torch.__version__} detected. PyTorch 2.0+ is recommended "
+               f"for better FFT operation tracing (STFT, RFFT, IRFFT).")
+        warnings_list.append(msg)
+
+    # Check coremltools version
+    try:
+        import coremltools as ct
+        ct_version = tuple(int(x) for x in ct.__version__.split('.')[:2])
+        if ct_version < (7, 0):
+            msg = (f"coremltools {ct.__version__} detected. Version 7.0+ is recommended "
+                   f"for better FFT operation support.")
+            warnings_list.append(msg)
+    except ImportError:
+        warnings_list.append("coremltools is not installed. Install with: pip install coremltools")
+
+    if verbose and warnings_list:
+        print("\n⚠️  Compatibility Warnings:")
+        for warning in warnings_list:
+            print(f"  - {warning}")
+        print()
+
+    return warnings_list
 
 
 def export_to_coreml(
@@ -55,7 +99,14 @@ def export_to_coreml(
 
     Returns:
         Path to the exported CoreML model
+
+    Note:
+        SCNet uses FFT operations (STFT, RFFT, IRFFT) which are traced and converted
+        to CoreML operations. There may be numerical differences compared to PyTorch.
     """
+    # Check compatibility
+    check_coreml_compatibility(verbose=verbose)
+
     try:
         import coremltools as ct
     except ImportError:
@@ -75,13 +126,27 @@ def export_to_coreml(
         print(f"  Input shape: {dummy_input.shape}")
         print(f"  Output path: {output_path}")
         print(f"  Compute units: {compute_units}")
+        print(f"  FFT operations: STFT, iSTFT, RFFT, iRFFT (via traced model)")
 
     # Trace the model
     if verbose:
         print("  Tracing PyTorch model...")
 
-    with torch.no_grad():
-        traced_model = torch.jit.trace(model, dummy_input)
+    try:
+        with torch.no_grad():
+            traced_model = torch.jit.trace(model, dummy_input)
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "stft" in error_msg or "fft" in error_msg:
+            print(f"\n❌ Tracing failed due to FFT operation: {e}")
+            print("\nTroubleshooting:")
+            print("  1. Ensure you're using PyTorch 2.0+")
+            print("  2. Try upgrading torch: pip install --upgrade torch")
+            raise RuntimeError(
+                f"FFT tracing failed. SCNet requires PyTorch 2.0+ for proper FFT tracing. "
+                f"Original error: {e}"
+            )
+        raise
 
     # Define input shape with flexible sequence length
     # Note: CoreML supports flexible shapes with RangeDim
