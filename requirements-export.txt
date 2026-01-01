@@ -1,0 +1,9 @@
+# Additional dependencies for exporting SCNet to ONNX and CoreML formats
+# Install with: pip install -r requirements-export.txt
+
+# ONNX export and validation
+onnx>=1.14.0
+onnxruntime>=1.15.0
+
+# CoreML export (macOS only for inference validation)
+coremltools>=7.0
